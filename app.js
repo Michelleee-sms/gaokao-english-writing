@@ -1258,6 +1258,28 @@ function highlightGrammarErrors(content, corrections) {
 }
 
 // AI Scoring
+// Bump this whenever the scoring engine changes so stored AI scores refresh.
+const SCORING_VERSION = 2;
+
+// Re-run the current engine over previously AI-scored submissions once per
+// version bump. Teacher-published ('published') scores are left untouched.
+function rescoreSubmissionsForVersion() {
+    if (localStorage.getItem('scoringVersion') === String(SCORING_VERSION)) return;
+    const submissions = JSON.parse(localStorage.getItem('submissions') || '[]');
+    let changed = false;
+    submissions.forEach(s => {
+        if (s.status === 'ai-scored' && s.content) {
+            try {
+                s.scores = scoreSubmission(s);
+                s.grammarCorrections = s.scores.grammarErrors;
+                changed = true;
+            } catch (e) { /* keep existing score on any edge case */ }
+        }
+    });
+    if (changed) localStorage.setItem('submissions', JSON.stringify(submissions));
+    localStorage.setItem('scoringVersion', String(SCORING_VERSION));
+}
+
 function scoreSubmission(submission) {
     const task = getTaskById(submission.taskId);
     const content = submission.content.toLowerCase();
@@ -1386,25 +1408,26 @@ function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPo
         
         // Language scoring
         else if (criterionName.includes('语言') || criterionName.includes('language')) {
-            score = maxScore;
-            
-            // Penalty for grammar errors
-            if (errorCount >= 8) score -= maxScore * 0.4;
-            else if (errorCount >= 5) score -= maxScore * 0.25;
-            else if (errorCount >= 3) score -= maxScore * 0.15;
-            else if (errorCount >= 1) score -= maxScore * 0.08;
-            
+            score = maxScore * 0.9; // neutral-good base
+
+            // Grammar penalty by density (tolerant of checker false-positives)
+            const sCount = Math.max(sentences.length, 1);
+            const eRate = errorCount / sCount;
+            score -= Math.min(maxScore * 0.45, eRate * maxScore * 0.9 + errorCount * maxScore * 0.03);
+
             // Bonus for advanced vocabulary
             const advancedWords = ['delighted', 'initiative', 'immersed', 'sustainable', 'appreciate', 'inspired', 'rewarding', 'representative', 'administration', 'engaging', 'meaningful', 'significant', 'valuable', 'beneficial'];
             const advancedCount = advancedWords.filter(w => content.includes(w)).length;
-            score = Math.min(maxScore, score + advancedCount * 0.15);
-            
+            score = Math.min(maxScore, score + Math.min(maxScore * 0.2, advancedCount * maxScore * 0.05));
+
             // Bonus for advanced sentence patterns
             const advancedPatterns = detectAdvancedPatterns(submission.content);
             const patternCount = Object.values(advancedPatterns).reduce((a, b) => a + b, 0);
-            if (patternCount >= 5) score = Math.min(maxScore, score + maxScore * 0.15);
-            else if (patternCount >= 3) score = Math.min(maxScore, score + maxScore * 0.1);
+            if (patternCount >= 4) score = Math.min(maxScore, score + maxScore * 0.15);
+            else if (patternCount >= 2) score = Math.min(maxScore, score + maxScore * 0.1);
             else if (patternCount >= 1) score = Math.min(maxScore, score + maxScore * 0.05);
+
+            score = Math.max(maxScore * 0.4, score); // floor 40%
         }
         
         // Structure scoring
@@ -1566,122 +1589,90 @@ function scoreSubmissionTestMode(submission, task, content, coverage, mainPoints
 
     contentScore = Math.max(0, Math.min(8, contentScore)); // Final cap at 8
 
-    // Score Language (0-8) - Balanced criteria
-    let languageScore = 4.0; // Reasonable base score
+    // Score Language (0-8) - balanced, rate-based to tolerate checker false-positives
+    let languageScore = 5.0; // neutral-good base ("mostly accurate" middle band)
 
-    // Check for advanced vocabulary - expanded list
+    // Advanced vocabulary
     const advancedWords = ['delighted', 'initiative', 'immersed', 'sustainable', 'appreciate', 'inspired', 'rewarding', 'representative', 'administration', 'engaging', 'meaningful', 'significant', 'valuable', 'beneficial', 'constructive', 'productive', 'enriching', 'fascinating', 'remarkable', 'extraordinary'];
     const advancedCount = advancedWords.filter(w => content.includes(w)).length;
-    languageScore += Math.min(2.5, advancedCount * 0.3);
+    languageScore += Math.min(1.5, advancedCount * 0.3);
 
-    // Check for complex sentences - stricter
+    // Complex sentence structures
     const hasParticiples = /\b\w+ing\s+\w+/i.test(content);
     const hasConditionals = /\b(if|when|while|as long as|in case|provided that)\b/i.test(content);
     const hasRelativeClauses = /\b(which|that|who|whom|whose)\b/i.test(content);
     const hasPassive = /\b(is|are|was|were|be|been|being)\s+\w+ed\b/i.test(content);
     const hasSubjunctive = /\b(wish|if only|as if|as though|suggest|recommend|insist)\b/i.test(content);
     const complexCount = [hasParticiples, hasConditionals, hasRelativeClauses, hasPassive, hasSubjunctive].filter(Boolean).length;
-    languageScore += Math.min(1.5, complexCount * 0.3);
-    
-    // Bonus for advanced sentence patterns (from the comprehensive list)
+    languageScore += Math.min(1.2, complexCount * 0.3);
+
+    // Advanced sentence patterns (inversion, cleft, with-compound, etc.)
     const advancedPatterns = detectAdvancedPatterns(submission.content);
     const patternCount = Object.values(advancedPatterns).reduce((a, b) => a + b, 0);
-    if (patternCount >= 5) languageScore += 0.8;
-    else if (patternCount >= 3) languageScore += 0.5;
+    if (patternCount >= 4) languageScore += 0.8;
+    else if (patternCount >= 2) languageScore += 0.5;
     else if (patternCount >= 1) languageScore += 0.3;
 
-    // Check for varied sentence structures
+    // Sentence-length variety
     const sentenceLengths = sentences.map(s => s.trim().split(/\s+/).length);
     const avgLength = sentenceLengths.reduce((a, b) => a + b, 0) / Math.max(sentenceLengths.length, 1);
     const lengthVariation = sentenceLengths.filter(l => Math.abs(l - avgLength) > 5).length / Math.max(sentenceLengths.length, 1);
+    if (lengthVariation > 0.3) languageScore += 0.4;
 
-    if (lengthVariation > 0.3) {
-        languageScore += 0.5; // Good sentence variety
-    }
-
-    // Penalty for simple/repetitive language - stricter
-    const simplePhrases = ['i think', 'we can', 'it is good', 'very good', 'i like', 'i want', 'we should', 'it is'];
-    const simpleCount = simplePhrases.filter(p => content.includes(p)).length;
-    if (simpleCount >= 5) {
-        languageScore -= 2.0;
-    } else if (simpleCount >= 3) {
-        languageScore -= 1.0;
-    } else if (simpleCount >= 2) {
-        languageScore -= 0.5;
-    }
-
-    // Penalty for grammar errors (use the grammar checker) - balanced
+    // Grammar errors — penalise by DENSITY (errors per sentence), not raw count,
+    // capped so false positives can't wreck the score.
     const grammarErrors = checkGrammar(submission.content);
     const errorCount = grammarErrors.length;
-    if (errorCount >= 8) {
-        languageScore -= 2.0;
-    } else if (errorCount >= 5) {
-        languageScore -= 1.0;
-    } else if (errorCount >= 3) {
-        languageScore -= 0.5;
-    } else if (errorCount >= 1) {
-        languageScore -= 0.25;
-    }
+    const sentenceCount = Math.max(sentences.length, 1);
+    const errorRate = errorCount / sentenceCount;
+    let grammarPenalty = Math.min(2.5, errorRate * 3.5 + errorCount * 0.1);
+    languageScore -= grammarPenalty;
 
-    languageScore = Math.max(0, Math.min(8, languageScore)); // Cap at 8
+    // Mild penalty for repetitive simple phrasing.
+    const simplePhrases = ['i think', 'we can', 'it is good', 'very good', 'i like', 'i want', 'we should', 'it is'];
+    const simpleCount = simplePhrases.filter(p => content.includes(p)).length;
+    if (simpleCount >= 5) languageScore -= 1.0;
+    else if (simpleCount >= 3) languageScore -= 0.5;
+    else if (simpleCount >= 2) languageScore -= 0.2;
 
-    // Score Structure (0-4, scored as /8 then halved) - Balanced
-    let structureRawScore = 4.0; // Reasonable base
+    languageScore = Math.max(2.0, Math.min(8, languageScore)); // floor 2, cap 8
 
-    // Check organization
+    // Score Structure (0-4) — organization signals only (not task-locked wording)
+    let structureRawScore = 4.0; // base /8
+
     const hasGreeting = /^dear\s+\w+/i.test(content.trim());
     const hasClosing = /\b(yours|best regards|sincerely|truly)\b/i.test(content);
     const hasClearParagraphs = content.split('\n\n').length >= 3;
-    const hasLogicalOrder = /\b(first|second|third|finally|as for|for|besides|moreover|however|therefore|in addition|in conclusion)\b/i.test(content);
+    const hasLogicalOrder = /\b(first|second|third|finally|as for|besides|moreover|however|therefore|in addition|in conclusion|what's more)\b/i.test(content);
 
     if (hasGreeting && hasClosing) structureRawScore += 0.8;
-    if (hasClearParagraphs) structureRawScore += 0.8;
-    if (hasLogicalOrder) structureRawScore += 0.8;
+    if (hasClearParagraphs) structureRawScore += 0.9;
+    if (hasLogicalOrder) structureRawScore += 0.9;
 
-    // Check for clear topic sentences
+    // Clear topic sentences at paragraph starts.
     const paragraphStarts = content.split('\n\n').map(p => p.trim().split('.')[0]);
     const hasTopicSentences = paragraphStarts.filter(p => p.length > 20).length >= 2;
     if (hasTopicSentences) structureRawScore += 0.5;
 
-    // Penalty for disorganized content
-    const formMentionedEarly = content.indexOf('form') < content.length / 2;
-    const contentMentionedAfter = content.indexOf('content') > content.length / 3;
-    if (!formMentionedEarly && !contentMentionedAfter) {
-        structureRawScore -= 1.0;
-    } else if (!formMentionedEarly || !contentMentionedAfter) {
-        structureRawScore -= 0.5;
-    }
+    // Light penalty only when clearly unstructured (no greeting AND one blob).
+    if (!hasGreeting && content.split('\n\n').length < 2) structureRawScore -= 1.0;
 
-    structureRawScore = Math.max(0, Math.min(8, structureRawScore)); // Cap at 8
+    structureRawScore = Math.max(0, Math.min(8, structureRawScore));
     let structureScore = structureRawScore / 2;
+
 
     // Calculate total
     const totalScore = Math.round((contentScore + languageScore + structureScore) * 2) / 2;
 
-    // 18+ requires exceptional quality in ALL dimensions - even stricter
+    // Gentle top-end guard: reserve 18-20 for genuinely strong, well-covered,
+    // accurate essays. Components are already balanced, so no harsh mid-tier cuts.
     if (totalScore >= 18) {
-        // Check if truly exceptional
-        const isExceptional = advancedCount >= 6 && complexCount >= 3 && coveragePercent === 100 &&
+        const isExceptional = advancedCount >= 5 && complexCount >= 3 && coveragePercent >= 100 &&
                              offTopicCount === 0 && errorCount <= 2 && depthIndicators >= 5 &&
                              sentenceDiversity >= 0.8 && elaborationRatio >= 0.3;
         if (!isExceptional) {
-            // Cap at 17.5 if not truly exceptional
-            const adjustedTotal = Math.min(17.5, totalScore);
-            // Redistribute scores proportionally
-            const ratio = adjustedTotal / totalScore;
-            contentScore = Math.round(contentScore * ratio * 2) / 2;
-            languageScore = Math.round(languageScore * ratio * 2) / 2;
-            structureScore = Math.round(structureScore * ratio * 2) / 2;
-        }
-    }
-
-    // 16+ also requires high quality
-    if (totalScore >= 16 && totalScore < 18) {
-        const isHighQuality = advancedCount >= 4 && complexCount >= 2 && coveragePercent >= 80 &&
-                             errorCount <= 4 && depthIndicators >= 4;
-        if (!isHighQuality) {
-            const adjustedTotal = Math.min(15.5, totalScore);
-            const ratio = adjustedTotal / totalScore;
+            const cap = 17.0;
+            const ratio = cap / totalScore;
             contentScore = Math.round(contentScore * ratio * 2) / 2;
             languageScore = Math.round(languageScore * ratio * 2) / 2;
             structureScore = Math.round(structureScore * ratio * 2) / 2;
@@ -2490,6 +2481,7 @@ function escapeHtml(text) {
 window.addEventListener('DOMContentLoaded', function() {
     initializeData();
     initializeMode();
+    rescoreSubmissionsForVersion();
     
     // Add event listener for example task link
     const taskLinkSelect = document.getElementById('example-task-link');
