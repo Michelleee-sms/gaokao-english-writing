@@ -364,15 +364,20 @@ function renderExamplesList() {
         return;
     }
 
+    const tasks = JSON.parse(localStorage.getItem('tasks') || '[]');
+    const taskTitle = (id) => { const t = tasks.find(t => t.id === id); return t ? t.title : '未关联任务'; };
+    const badgeFor = (band) => band === '17-20' || band === '17-19' ? 'badge-excellent' :
+                               band === '13-16' || band === '13-15' ? 'badge-good' :
+                               band === '9-12' || band === '9-11' ? 'badge-pass' : 'badge-pass';
+
     container.innerHTML = examples.map(ex => {
-        const badgeClass = ex.scoreBand === '17-19' ? 'badge-excellent' : 
-                          ex.scoreBand === '13-15' ? 'badge-good' : 'badge-pass';
         return `
             <div class="card">
                 <div class="card-header">
                     <div class="card-title">${escapeHtml(ex.title)}</div>
-                    <span class="badge ${badgeClass}">${ex.scoreBand}分</span>
+                    <span class="badge ${badgeFor(ex.scoreBand)}">${ex.scoreBand}分 · ${ex.totalScore}/20</span>
                 </div>
+                <div class="card-meta"><span>📌 ${escapeHtml(taskTitle(ex.taskId))}</span></div>
                 <div class="card-content">${escapeHtml(ex.content.substring(0, 150))}...</div>
                 <div class="card-actions">
                     <button onclick="viewExample('${ex.id}')" class="btn btn-secondary btn-small">查看</button>
@@ -672,15 +677,19 @@ function renderExamplesListStudent() {
         return;
     }
 
+    const tasks = JSON.parse(localStorage.getItem('tasks') || '[]');
+    const taskTitle = (id) => { const t = tasks.find(t => t.id === id); return t ? t.title : '未关联任务'; };
+    const badgeFor = (band) => band === '17-20' || band === '17-19' ? 'badge-excellent' :
+                               band === '13-16' || band === '13-15' ? 'badge-good' : 'badge-pass';
+
     container.innerHTML = examples.map(ex => {
-        const badgeClass = ex.scoreBand === '17-19' ? 'badge-excellent' : 
-                          ex.scoreBand === '13-15' ? 'badge-good' : 'badge-pass';
         return `
             <div class="card">
                 <div class="card-header">
                     <div class="card-title">${escapeHtml(ex.title)}</div>
-                    <span class="badge ${badgeClass}">${ex.scoreBand}分</span>
+                    <span class="badge ${badgeFor(ex.scoreBand)}">${ex.scoreBand}分 · ${ex.totalScore}/20</span>
                 </div>
+                <div class="card-meta"><span>📌 ${escapeHtml(taskTitle(ex.taskId))}</span></div>
                 <div class="card-content">${escapeHtml(ex.content.substring(0, 150))}...</div>
                 <div class="card-actions">
                     <button onclick="viewExample('${ex.id}')" class="btn btn-secondary btn-small">查看范文</button>
@@ -817,6 +826,11 @@ function submitWriting() {
 
     submissions.push(submission);
     localStorage.setItem('submissions', JSON.stringify(submissions));
+
+    // Auto-extract high-scoring essays (>16) into the materials library.
+    if (submission.scores && submission.scores.total > 16) {
+        addToKnowledgeBase(submission, 'auto-ai');
+    }
 
     closeModal('writing-modal');
 
@@ -1266,10 +1280,8 @@ function scoreSubmission(submission) {
 function findSimilarExamples(task, submission) {
     const examples = JSON.parse(localStorage.getItem('examples') || '[]');
     
-    // Filter examples related to this task or general examples
-    const relevantExamples = examples.filter(ex => {
-        return !ex.taskId || ex.taskId === task.id;
-    });
+    // Examples are bound to a single task — only compare within the same task.
+    const relevantExamples = examples.filter(ex => ex.taskId && ex.taskId === task.id);
     
     // Calculate similarity scores based on content features
     const submissionWords = submission.content.toLowerCase().split(/\s+/).length;
@@ -1355,8 +1367,9 @@ function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPo
         
         // Content scoring
         if (criterionName.includes('内容') || criterionName.includes('content')) {
-            const coveragePercent = (coverage.covered / coverage.total) * 100;
-            score = (coveragePercent / 100) * maxScore;
+            const reliable = mainPoints.length > 0 && coverage.confident !== false;
+            const coveragePercent = reliable ? (coverage.covered / coverage.total) * 100 : 70;
+            score = Math.max(maxScore * 0.35, (coveragePercent / 100) * maxScore);
             
             // Check for richness
             const hasNumbers = /\d+/.test(content);
@@ -1480,9 +1493,12 @@ function scoreSubmissionTestMode(submission, task, content, coverage, mainPoints
     
     // Score Content (0-8) - Balanced criteria
     let contentScore = 0;
-    const coveragePercent = (coverage.covered / coverage.total) * 100;
+    // If we have no extractable main points or the coverage match wasn't
+    // reliable, use a neutral base instead of collapsing to 0.
+    const reliableCoverage = mainPoints.length > 0 && coverage.confident !== false;
+    const coveragePercent = reliableCoverage ? (coverage.covered / coverage.total) * 100 : 75;
 
-    // Base score from coverage - reasonable base
+    // Base score from coverage - reasonable base (with a floor)
     if (coveragePercent >= 100) {
         contentScore = 4.5;
     } else if (coveragePercent >= 80) {
@@ -1490,7 +1506,7 @@ function scoreSubmissionTestMode(submission, task, content, coverage, mainPoints
     } else if (coveragePercent >= 60) {
         contentScore = 3.5;
     } else {
-        contentScore = coveragePercent / 60 * 3.5;
+        contentScore = Math.max(2.0, coveragePercent / 60 * 3.5);
     }
 
     // Richness and specificity checks - much stricter
@@ -1686,51 +1702,98 @@ function scoreSubmissionTestMode(submission, task, content, coverage, mainPoints
     };
 }
 
+// Extract the required "main points" from a Chinese/English prompt.
+// Handles numbered points whether each is on its own line or all inline,
+// and supports separators ． . 、 ) ） .
 function extractMainPoints(prompt) {
+    if (!prompt) return [];
+    // Collapse whitespace/newlines so inline numbering is handled uniformly.
+    const p = prompt.replace(/\s+/g, ' ');
+    const markerRe = /(\d{1,2})\s*[．.、)）]/g;
+    const marks = [...p.matchAll(markerRe)];
+    if (marks.length === 0) return [];
+
     const points = [];
-    const lines = prompt.split('\n');
-    
-    for (let line of lines) {
-        const match = line.match(/\d+[．.]\s*(.+)/);
-        if (match) {
-            points.push(match[1].trim());
+    for (let i = 0; i < marks.length; i++) {
+        const start = marks[i].index + marks[i][0].length;
+        const end = i + 1 < marks.length ? marks[i + 1].index : p.length;
+        let seg = p.slice(start, end).trim();
+        // Trim trailing punctuation and stop at a closing 句号 if present.
+        seg = seg.replace(/[；;、,，\s]+$/, '').split('。')[0].trim();
+        if (seg.length >= 1 && seg.length <= 40 && /[\u4e00-\u9fa5A-Za-z]/.test(seg)) {
+            points.push(seg);
         }
     }
-    
-    return points.length > 0 ? points : ['活动形式', '活动内容'];
+    return points;
 }
 
-function analyzeCoverage(content, mainPoints) {
-    let covered = 0;
-    const details = [];
-    
-    for (let point of mainPoints) {
-        const keywords = point.split('').filter(c => c.match(/[\u4e00-\u9fa5]/)).join('');
-        const englishKeywords = {
-            '活动形式': ['form', 'type', 'style', 'way', 'activity'],
-            '活动内容': ['content', 'activity', 'do', 'visit', 'learn', 'experience']
-        };
-        
-        let isCovered = false;
-        for (let key in englishKeywords) {
-            if (point.includes(key)) {
-                isCovered = englishKeywords[key].some(k => content.includes(k));
-                break;
-            }
-        }
-        
-        if (isCovered) covered++;
-        details.push({
-            point: point,
-            covered: isCovered
-        });
+// Small bilingual glossary so a Chinese main point can be matched against an
+// English essay. Extend freely — this only backs the rule-based fallback; the
+// AI grader (Kimi) handles content understanding directly.
+const COVERAGE_GLOSSARY = {
+    '活动形式': ['form', 'type', 'kind', 'style', 'way', 'activity', 'event', 'organize', 'hold'],
+    '活动内容': ['content', 'visit', 'learn', 'experience', 'activity', 'participate', 'take part', 'do'],
+    '活动安排': ['schedule', 'arrange', 'plan', 'time', 'first', 'then', 'finally'],
+    '建议': ['suggest', 'recommend', 'advice', 'should', 'could', 'propose'],
+    '邀请': ['invite', 'invitation', 'welcome', 'join'],
+    '感谢': ['thank', 'grateful', 'appreciate', 'thanks'],
+    '介绍': ['introduce', 'introduction', 'about', 'which is'],
+    '目的': ['purpose', 'aim', 'to', 'in order to', 'so as to', 'aimed at'],
+    '意义': ['meaning', 'significant', 'important', 'benefit', 'helpful', 'value', 'help'],
+    '感受': ['feel', 'feeling', 'excited', 'happy', 'glad', 'pleased', 'delighted', 'impressed'],
+    '时间': ['time', ' morning', ' afternoon', " o'clock", 'date', 'june', 'july', 'monday'],
+    '地点': ['place', 'location', 'park', 'school', 'museum', 'library', 'center', 'hall', 'square', 'here', 'there'],
+    '主题': ['theme', 'topic', 'subject', 'titled', 'named'],
+    '准备': ['prepare', 'preparation', 'ready', 'get ready'],
+    '注意事项': ['notice', 'attention', 'should', 'must', 'remember', 'keep in mind']
+};
+
+// Build English search terms for one main point.
+function englishTermsForPoint(point) {
+    const terms = new Set();
+    // Exact/loose glossary hits (point contains the key, or key contains point).
+    for (const [zh, enList] of Object.entries(COVERAGE_GLOSSARY)) {
+        if (point.includes(zh) || zh.includes(point)) enList.forEach(e => terms.add(e.toLowerCase()));
     }
-    
-    return {
-        covered: covered,
-        total: mainPoints.length,
-        details: details
-    };
+    // Any English words already present in the point itself.
+    (point.replace(/[^A-Za-z]/g, ' ').match(/[a-z]{3,}/gi) || []).forEach(w => terms.add(w.toLowerCase()));
+    // 2-char CJK sub-tokens as a last-resort literal (works if the essay quotes Chinese).
+    const cjk = point.match(/[一-龥]{2,}/g);
+    if (cjk) cjk.forEach(seg => { for (let i = 0; i + 2 <= seg.length; i++) terms.add(seg.substr(i, 2)); });
+    return [...terms];
+}
+
+// Tolerant coverage analysis. Returns { covered, total, details, confident }.
+// A point counts as covered if the essay contains any of its English terms.
+// If we cannot derive meaningful terms (rare/unseen topic), we fall back to an
+// on-topic heuristic instead of scoring 0, and mark confident=false.
+function analyzeCoverage(content, mainPoints) {
+    const total = Math.max(mainPoints.length, 1);
+    const contentLower = content.toLowerCase();
+    // Strip greeting/closing noise for length estimate.
+    const essayHasSubstance = content.trim().split(/\s+/).length >= 60;
+    let covered = 0;
+    let confident = true;
+    const details = [];
+
+    for (let point of mainPoints) {
+        const terms = englishTermsForPoint(point)
+            .filter(t => t.length >= 2)
+            .sort((a, b) => b.length - a.length); // longest/most-specific first
+        const usable = terms.filter(t => /[a-z ]/.test(t));
+        let isCovered = false;
+        if (usable.length > 0) {
+            isCovered = usable.some(t => contentLower.includes(t.toLowerCase()));
+        } else {
+            // No translatable terms → can't judge reliably; don't penalise hard.
+            isCovered = essayHasSubstance;
+            confident = false;
+        }
+        if (isCovered) covered++;
+        details.push({ point: point, covered: isCovered });
+    }
+
+    return { covered, total: mainPoints.length || 1, details, confident };
 }
 
 function generateFeedback(coverage, contentScore, languageScore, structureScore, content, grammarErrors = []) {
@@ -1924,7 +1987,7 @@ function publishScores() {
     loadTeacherDashboard();
 }
 
-function addToKnowledgeBase(submission) {
+function addToKnowledgeBase(submission, sourceLabel) {
     const task = getTaskById(submission.taskId);
     const theme = task ? detectTheme(task.prompt) : '通用';
     const themeMap = {
@@ -1938,21 +2001,28 @@ function addToKnowledgeBase(submission) {
     };
     const materialTheme = themeMap[theme] || '通用/General';
 
-    const summary = summarizeContent(submission.content);
-
     const materials = JSON.parse(localStorage.getItem('materials') || '[]');
+    // Avoid duplicates: only one auto-material per submission.
+    if (submission.id && materials.some(m => m.fromSubmissionId === submission.id)) {
+        return false;
+    }
+
+    const summary = summarizeContent(submission.content);
     materials.push({
         id: 'mat-' + Date.now(),
         theme: materialTheme,
         title: `高分作文素材 (${submission.scores.total}分) - ${task ? task.title : '未知任务'}`,
         content: summary,
         keywords: extractKeywords(submission.content),
-        source: 'auto',
+        source: sourceLabel || 'auto',
+        taskId: submission.taskId || null,
+        fromSubmissionId: submission.id || null,
         originalScore: submission.scores.total,
         createdAt: new Date().toISOString()
     });
 
     localStorage.setItem('materials', JSON.stringify(materials));
+    return true;
 }
 
 function summarizeContent(content) {
@@ -2084,19 +2154,21 @@ function viewSubmission(submissionId) {
 
 // Example Management
 function showAddExample() {
-    document.getElementById('example-form').reset();
-    
-    // Populate task dropdown
     const tasks = JSON.parse(localStorage.getItem('tasks') || '[]');
+    if (tasks.length === 0) {
+        alert('请先创建任务再添加范文 / Please create a task before adding examples.');
+        return;
+    }
+    document.getElementById('example-form').reset();
+
+    // Populate task dropdown (task is now required — no general option).
     const taskSelect = document.getElementById('example-task-link');
-    taskSelect.innerHTML = '<option value="">通用范文 / General Example</option>';
-    tasks.forEach(task => {
-        taskSelect.innerHTML += `<option value="${task.id}">${task.title}</option>`;
-    });
-    
-    // Show criteria scores based on mode
+    taskSelect.innerHTML = '<option value="">请选择任务 / Select a task…</option>' +
+        tasks.map(task => `<option value="${task.id}">${escapeHtml(task.title)}</option>`).join('');
+
+    // Show criteria scores based on mode (defaults to Test-Mode criteria until a task is chosen).
     updateExampleCriteriaScores();
-    
+
     showModal('example-modal');
 }
 
@@ -2150,6 +2222,10 @@ function saveExample() {
     
     if (!title || !content || isNaN(totalScore)) {
         alert('请填写标题、内容和总分 / Please fill in title, content and total score');
+        return;
+    }
+    if (!taskId) {
+        alert('请选择关联任务（范文必须绑定到具体题目）/ Please choose a task — examples must be tied to one.');
         return;
     }
     
