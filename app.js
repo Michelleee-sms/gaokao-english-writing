@@ -1263,7 +1263,7 @@ function highlightGrammarErrors(content, corrections) {
 
 // AI Scoring
 // Bump this whenever the scoring engine changes so stored AI scores refresh.
-const SCORING_VERSION = 4;
+const SCORING_VERSION = 6;
 
 // Re-run the current engine over previously AI-scored submissions once per
 // version bump. Teacher-published ('published') scores are left untouched.
@@ -1349,24 +1349,18 @@ function calibrateWithExamples(scores, similarExamples, task) {
             // Handwriting is a fixed rule-based value — never calibrate it.
             if (lname.includes('书写') || lname.includes('handwriting')) return;
 
+            // Only examples that actually record this criterion count as calibration signal.
+            const sampleScores = topExamples
+                .map(item => item.example.criterionScores && item.example.criterionScores[criterionName])
+                .filter(v => typeof v === 'number' && v > 0);
+            if (sampleScores.length === 0) return; // no reliable reference → keep rule-based score
+
             const currentScore = scores.customScores[criterionName] || 0;
+            const avgCriterionScore = sampleScores.reduce((a, b) => a + b, 0) / sampleScores.length;
 
-            // Find average for this criterion in examples
-            const avgCriterionScore = topExamples.reduce((sum, item) => {
-                return sum + ((item.example.criterionScores && item.example.criterionScores[criterionName]) || 0);
-            }, 0) / topExamples.length;
-
-            // Calibrate
-            let calibrated = Math.round(
+            scores.customScores[criterionName] = Math.round(
                 (currentScore * (1 - calibrationWeight) + avgCriterionScore * calibrationWeight) * 2
             ) / 2;
-
-            // Never let calibration collapse content/language below their floors.
-            const ms = criterion.score;
-            if (lname.includes('内容') || lname.includes('content')) calibrated = Math.max(calibrated, ms * 0.5);
-            else if (lname.includes('语言') || lname.includes('language')) calibrated = Math.max(calibrated, ms * 0.35);
-
-            scores.customScores[criterionName] = calibrated;
         });
         
         // Recalculate total
@@ -1379,11 +1373,29 @@ function calibrateWithExamples(scores, similarExamples, task) {
 }
 
 function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPoints) {
-    const wordCount = submission.wordCount;
+    const wordCount = submission.wordCount || (content.split(/\s+/).filter(Boolean).length);
     const sentences = content.split(/[.!?]+/).filter(s => s.trim().length > 10);
     const grammarErrors = checkGrammar(submission.content);
     const errorCount = grammarErrors.length;
-    
+
+    // Shared quality signals used across criteria (fixes "everything scores ~base").
+    const words = content.split(/\s+/).filter(Boolean);
+    const wordTokens = words.map(w => w.replace(/[^a-z']/gi, '')).filter(Boolean);
+    const uniqueTokens = new Set(wordTokens).size;
+    const lexical = wordTokens.length ? uniqueTokens / wordTokens.length : 0; // 0..1
+    const sCount = Math.max(sentences.length, 1);
+    const avgSentenceLen = wordTokens.length ? wordTokens.length / sCount : 0;
+    const complexity = Math.max(0, Math.min(1, (avgSentenceLen - 6) / 12)); // 6 words→0, 18+→1
+    const vocab = Math.max(0, Math.min(1, (lexical - 0.35) / 0.35));        // 0.35→0, 0.7+→1
+
+    // Length adequacy: a thin answer must not score like a full one.
+    let lengthFactor;
+    if (wordCount < 40) lengthFactor = 0.45;
+    else if (wordCount < 70) lengthFactor = 0.65;
+    else if (wordCount < 100) lengthFactor = 0.85;
+    else if (wordCount <= 180) lengthFactor = 1.0;
+    else lengthFactor = 0.97;
+
     const customScores = {};
     const criteriaMap = {
         '内容': 'content',
@@ -1402,65 +1414,61 @@ function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPo
         let score = 0;
         const maxScore = criterion.score;
         
-        // Content scoring — substance + relevance, never collapses
+        // Content scoring — relevance (coverage) + substance, scaled by length
         if (criterionName.includes('内容') || criterionName.includes('content')) {
             const reliable = mainPoints.length > 0 && coverage.confident !== false;
-            const covRatio = reliable ? (coverage.covered / coverage.total) : 0.7;
+            const covRatio = reliable ? (coverage.covered / coverage.total) : 0.55;
 
             const hasNumbers = /\d+/.test(content);
             const hasSpecificPlaces = /\b(park|museum|library|school|center|hall|garden|square)\b/i.test(content);
-            const hasSpecificActivities = /\b(visit|learn|experience|explore|discover|practice|create|build|organize|prepare)\b/i.test(content);
+            const hasSpecificActivities = /\b(visit|learn|experience|explore|discover|practice|create|build|organize|prepare|performance|competition|show|market)\b/i.test(content);
             const hasReasons = /\b(because|since|as|reason|due to|in order to|so that)\b/i.test(content);
-            const hasBenefits = /\b(benefit|helpful|important|valuable|meaningful|useful|good for|contribute to)\b/i.test(content);
-            const hasFeelings = /\b(excited|happy|glad|pleased|delighted|interested|inspired|motivated|encouraged)\b/i.test(content);
+            const hasBenefits = /\b(benefit|helpful|important|valuable|meaningful|useful|good for|good chance|contribute to|relax)\b/i.test(content);
+            const hasFeelings = /\b(excited|happy|glad|pleased|delighted|interested|inspired|motivated|encouraged|fun|enjoy)\b/i.test(content);
             const depthIndicators = [hasNumbers, hasSpecificPlaces, hasSpecificActivities, hasReasons, hasBenefits, hasFeelings].filter(Boolean).length;
 
-            // Coverage drives 35%–85% of max; depth nudges up. Full marks need a near-perfect essay.
-            score = maxScore * (0.35 + 0.5 * covRatio);
-            if (depthIndicators >= 4) score = Math.min(maxScore, score * 1.06);
-            else if (depthIndicators >= 2) score = Math.min(maxScore, score * 1.03);
-            // Too short → clearly incomplete content.
-            if (wordCount < 60) score = Math.min(score, maxScore * 0.5);
-            score = Math.max(maxScore * 0.5, score); // hard floor 50%
+            // Relevance drives 40%–95%; depth adds a little; length scales the whole thing.
+            let base = 0.4 + 0.5 * covRatio;
+            if (depthIndicators >= 5) base += 0.06;
+            else if (depthIndicators >= 3) base += 0.03;
+            base = Math.min(0.9, base); // even a near-perfect answer caps at ~4.5/5
+            score = maxScore * base * lengthFactor;
         }
 
-        // Language scoring — stricter base, density-based penalty
+        // Language scoring — accuracy + complexity + range, scaled by length
         else if (criterionName.includes('语言') || criterionName.includes('language')) {
-            score = maxScore * 0.7; // middle base (kept intentionally modest)
-
-            const sCount = Math.max(sentences.length, 1);
             const eRate = errorCount / sCount;
-            score -= Math.min(maxScore * 0.5, eRate * maxScore * 1.1 + errorCount * maxScore * 0.04);
+            const accuracy = 1 - Math.min(0.5, eRate * 0.8 + errorCount * 0.02);
 
-            const advancedWords = ['delighted', 'initiative', 'immersed', 'sustainable', 'appreciate', 'inspired', 'rewarding', 'representative', 'administration', 'engaging', 'meaningful', 'significant', 'valuable', 'beneficial'];
-            const advancedCount = advancedWords.filter(w => content.includes(w)).length;
-            score = Math.min(maxScore, score + Math.min(maxScore * 0.15, advancedCount * maxScore * 0.04));
+            let q = accuracy * 0.5 + complexity * 0.3 + vocab * 0.2; // 0..1
+            score = maxScore * (0.25 + 0.58 * q) * lengthFactor;
 
+            // Small credit for genuine advanced structures
             const advancedPatterns = detectAdvancedPatterns(submission.content);
             const patternCount = Object.values(advancedPatterns).reduce((a, b) => a + b, 0);
-            if (patternCount >= 4) score = Math.min(maxScore, score + maxScore * 0.12);
-            else if (patternCount >= 2) score = Math.min(maxScore, score + maxScore * 0.07);
-            else if (patternCount >= 1) score = Math.min(maxScore, score + maxScore * 0.03);
+            if (patternCount >= 4) score = Math.min(maxScore, score + maxScore * 0.04);
+            else if (patternCount >= 2) score = Math.min(maxScore, score + maxScore * 0.02);
 
-            score = Math.max(maxScore * 0.35, score); // floor 35%
+            score = Math.max(maxScore * 0.2, score); // small floor so nothing is 0
         }
 
-        // Structure scoring — stricter, rewards real organization
+        // Structure scoring — real organisation earned, scaled by length
         else if (criterionName.includes('结构') || criterionName.includes('structure')) {
-            score = maxScore * 0.35; // base
-
             const hasGreeting = /^dear\s+\w+/i.test(content.trim());
             const hasClosing = /\b(yours|best regards|sincerely|truly)\b/i.test(content);
             const paragraphs = content.split('\n\n').filter(p => p.trim().length > 0).length;
-            const hasClearParagraphs = paragraphs >= 3;
-            const hasLogicalOrder = /\b(first|second|third|finally|as for|besides|moreover|however|therefore|in addition|in conclusion|what's more)\b/i.test(content);
-            const connectorCount = (content.match(/\b(first|second|third|finally|as for|besides|moreover|however|therefore|in addition|in conclusion|what's more|in addition)\b/gi) || []).length;
+            const connectorCount = (content.match(/\b(first|second|third|finally|as for|besides|moreover|however|therefore|in addition|in conclusion|what's more)\b/gi) || []).length;
 
-            if (hasGreeting && hasClosing) score += maxScore * 0.1;
-            if (hasClearParagraphs) score += maxScore * 0.15;
-            if (hasLogicalOrder) score += maxScore * 0.1;
-            if (connectorCount >= 3) score += maxScore * 0.1;
+            let feat = 0;
+            if (hasGreeting && hasClosing) feat += 0.1;
+            if (paragraphs >= 3) feat += 0.2;
+            else if (paragraphs === 2) feat += 0.1;
+            if (connectorCount >= 1) feat += 0.1;
+            if (connectorCount >= 3) feat += 0.1;
+            // Coherent, developed paragraphs (needs real sentences, not fragments)
+            if (paragraphs >= 3 && avgSentenceLen >= 9 && wordCount >= 80) feat += 0.05;
 
+            score = maxScore * (0.15 + feat) * Math.sqrt(lengthFactor);
             score = Math.min(maxScore, score);
         }
 
