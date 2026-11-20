@@ -983,11 +983,21 @@ function checkGrammar(content) {
     ];
 
     // Article errors (a/an/the)
+    // Words whose first letter is a vowel but pronounced with a consonant sound → take "a"
+    const CONSONANT_SOUND = /^(uni|uniform|united|union|universal|user|use|used|useful|useless|usual|utility|utilize|european|euro|eu|eulogy|ewe|one|once|one-)/i;
+    // Words whose first letter is a consonant but pronounced with a vowel sound (silent h) → take "an"
+    const VOWEL_SILENT_H = /^(hour|honour|honor|heir|honest|honesty|herb)\b/i;
     const articleErrors = [
-        { pattern: /\ba\s+([aeiou]\w+)/gi, correction: 'an $1', explanation: '元音音素开头的词前应使用an' },
-        { pattern: /\ban\s+([bcdfghjklmnpqrstvwxyz]\w+)/gi, correction: 'a $1', explanation: '辅音音素开头的词前应使用a' },
+        { pattern: /\ba\s+([aeiou]\w+)/gi, correction: 'an $1', explanation: '元音音素开头的词前应使用an', validator: (m) => {
+            const w = m.replace(/^a\s+/i, '');
+            return !CONSONANT_SOUND.test(w); // skip "a university" etc.
+        }},
+        { pattern: /\ban\s+([bcdfghjklmnpqrstvwxyz]\w+)/gi, correction: 'a $1', explanation: '辅音音素开头的词前应使用a', validator: (m) => {
+            const w = m.replace(/^an\s+/i, '');
+            return !VOWEL_SILENT_H.test(w); // "an hour" is correct
+        }},
         { pattern: /\bthe\s+(school|home|bed|church|hospital|prison|college|university)\s+(is|are|was|were)\b/gi, correction: null, explanation: '表示泛指时不需要the：school/home/bed等' },
-        { pattern: /\bgo\s+to\s+(the\s+)?(home|bed|school)\b/gi, correction: 'go home/to bed/to school', explanation: 'go home/bed/school不需要the' },
+        { pattern: /\bgo\s+to\s+home\b/gi, correction: 'go home', explanation: 'go home 中间不加 to' },
         // Missing article before singular countable nouns
         { pattern: /\b(protect|save|clean|pollute|damage)\s+(environment|nature|ecology)\b/gi, correction: null, explanation: '可数名词单数前需加限定词：the environment' },
         { pattern: /\b(a|an)\s+(information|advice|knowledge|news|homework|furniture|luggage|baggage|evidence|progress|research)\b/gi, correction: null, explanation: '不可数名词前不能加a/an' }
@@ -995,13 +1005,6 @@ function checkGrammar(content) {
     
     // Non-finite verb errors (to do / doing / done)
     const nonFiniteVerbErrors = [
-        // want/need/hope + to do (not base form)
-        { pattern: /\b(want|need|hope|wish|expect|decide|plan|agree|choose|learn|prepare|pretend|refuse|manage|offer|promise|fail|afford)\s+(?!to\s+)(\w+)\b/gi, correction: null, explanation: '这些动词后应接to do，不是动词原形', validator: (match) => {
-            const parts = match.split(/\s+/);
-            const verb = parts[parts.length - 1];
-            // Exclude common words that can follow these verbs
-            return !['to', 'a', 'an', 'the', 'this', 'that', 'it', 'me', 'you', 'him', 'her', 'us', 'them'].includes(verb.toLowerCase());
-        }},
         // enjoy/finish/practice + doing (not to do)
         { pattern: /\b(enjoy|finish|practice|consider|suggest|avoid|keep|mind|imagine|delay|risk|miss)\s+to\s+(\w+)\b/gi, correction: null, explanation: '这些动词后应接doing，不是to do' },
         // Verb + verb without to or ing (I want go -> I want to go)
@@ -1037,17 +1040,14 @@ function checkGrammar(content) {
         { pattern: /\bfew\s+(information|advice|knowledge|news|homework|furniture|luggage|baggage|evidence|progress|research)\b/gi, correction: 'little', explanation: '不可数名词应使用little，不是few' }
     ];
 
-    // Common Chinglish patterns (expanded)
+    // Common Chinglish patterns (real errors only, bounded within a sentence)
     const chinglishPatterns = [
-        { pattern: /\bplay\s+(computer|phone|mobile|game|basketball|football|ping-pong|tennis)\b/gi, correction: 'use/play', explanation: '中式英语：play computer → use computer; play basketball可以但play computer不行' },
-        { pattern: /\b(open|close)\s+(the|your)?\s*(computer|phone|light|fan|door|window)\b/gi, correction: 'turn on/off', explanation: '中式英语：开关电器应使用turn on/off，不是open/close' },
-        { pattern: /\blearn\s+(knowledge|skills|abilities)\b/gi, correction: 'gain/acquire/develop', explanation: '中式英语：learn knowledge → gain knowledge' },
+        { pattern: /\bplay\s+(computer|phone|mobile)\b/gi, correction: 'use', explanation: '中式英语：play computer/phone → use the computer/phone' },
+        { pattern: /\b(open|close)\s+(the\s+|your\s+)?(computer|light|fan)\b/gi, correction: 'turn on/off', explanation: '中式英语：开关电器应使用turn on/off，不是open/close' },
+        { pattern: /\blearn\s+(knowledge)\b/gi, correction: 'gain/acquire', explanation: '中式英语：learn knowledge → gain knowledge' },
         { pattern: /\bvery\s+(like|love|enjoy|prefer|want|need|hope|wish)\b/gi, correction: 'really like/love', explanation: '中式英语：very like → really like' },
-        { pattern: /\b(because|although|though|if|when|while)\s+.+\s+(so|but|and|or)\b/gi, correction: null, explanation: '连词错误：although/because不能与but/so连用' },
-        { pattern: /\bmore\s+and\s+more\s+\w+\b/gi, correction: null, explanation: '建议：使用increasingly/growing等更地道的表达' },
-        { pattern: /\bwith\s+the\s+development\s+of\b/gi, correction: null, explanation: '中式英语：建议用As...develops/With...developing' },
-        { pattern: /\bin\s+my\s+opinion,?\s+i\s+think\b/gi, correction: 'In my opinion/I think', explanation: '冗余表达：in my opinion和I think重复' },
-        { pattern: /\bnot\s+only\s+.+\s+but\s+also\s+.+\b/gi, correction: null, explanation: '注意not only...but also的平行结构' },
+        { pattern: /\bbecause\b[^.!?\n]*?\bso\b/gi, correction: null, explanation: '连词错误：because 不能与 so 连用，去掉其一' },
+        { pattern: /\b(although|though)\b[^.!?\n]*?\bbut\b/gi, correction: null, explanation: '连词错误：although/though 不能与 but 连用，去掉其一' },
         { pattern: /\bthe\s+number\s+of\s+\w+\s+(are|were|have)\b/gi, correction: 'is/was/has', explanation: 'the number of+复数名词，谓语用单数' },
         { pattern: /\ba\s+number\s+of\s+\w+\s+(is|was|has)\b/gi, correction: 'are/were/have', explanation: 'a number of+复数名词，谓语用复数' },
         { pattern: /\beach\s+of\s+\w+\s+(are|were|have)\b/gi, correction: 'is/was/has', explanation: 'each of+复数名词，谓语用单数' },
@@ -1100,9 +1100,7 @@ function checkGrammar(content) {
 
     // Sentence structure errors
     const structureErrors = [
-        { pattern: /\bthere\s+be\s+\w+\s+(is|are|was|were)\b/gi, correction: null, explanation: 'there be句型错误：不能重复使用be动词' },
-        { pattern: /\b(although|though|because|since|as|if|when|while|until|unless)\s+.+\.\s*(so|but|and|or|however|therefore)\b/gi, correction: null, explanation: '从句后不应再使用连词' },
-        { pattern: /\.\s+(but|and|so|or|however|therefore|moreover|furthermore|besides)\s+/gi, correction: null, explanation: '句首使用连词时应注意句子完整性' }
+        { pattern: /\bthere\s+(is|are|was|were)\s+\w+\s+(is|are|was|were)\b/gi, correction: null, explanation: 'there be句型错误：不能重复使用be动词' }
     ];
 
     // Verb pattern errors (infinitive/gerund mistakes) - only actual errors
@@ -1158,9 +1156,15 @@ function checkGrammar(content) {
                 // Skip if correction is same as match (not a real error)
                 if (error.correction && match.toLowerCase() === error.correction.toLowerCase()) continue;
 
+                // Expand capture-group templates like "an $1" into concrete text.
+                let corrected = error.correction;
+                if (corrected && corrected.indexOf('$1') !== -1) {
+                    try { corrected = match.replace(error.pattern, corrected); } catch (e) { /* keep template */ }
+                }
+
                 corrections.push({
                     original: match,
-                    correction: error.correction || match,
+                    correction: corrected || match,
                     explanation: error.explanation
                 });
             }
@@ -1182,11 +1186,11 @@ function checkGrammar(content) {
         }
     }
 
-    // Remove duplicates
+    // Remove duplicates (same matched text → keep the first, most specific hit)
     const unique = [];
     const seen = new Set();
     for (let c of corrections) {
-        const key = c.original.toLowerCase() + '|' + c.explanation;
+        const key = c.original.toLowerCase().trim();
         if (!seen.has(key)) {
             seen.add(key);
             unique.push(c);
@@ -1259,7 +1263,7 @@ function highlightGrammarErrors(content, corrections) {
 
 // AI Scoring
 // Bump this whenever the scoring engine changes so stored AI scores refresh.
-const SCORING_VERSION = 3;
+const SCORING_VERSION = 4;
 
 // Re-run the current engine over previously AI-scored submissions once per
 // version bump. Teacher-published ('published') scores are left untouched.
@@ -1411,10 +1415,10 @@ function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPo
             const hasFeelings = /\b(excited|happy|glad|pleased|delighted|interested|inspired|motivated|encouraged)\b/i.test(content);
             const depthIndicators = [hasNumbers, hasSpecificPlaces, hasSpecificActivities, hasReasons, hasBenefits, hasFeelings].filter(Boolean).length;
 
-            // 50%–100% of max from coverage, then depth nudges up.
-            score = maxScore * (0.5 + 0.5 * covRatio);
-            if (depthIndicators >= 4) score = Math.min(maxScore, score * 1.1);
-            else if (depthIndicators >= 2) score = Math.min(maxScore, score * 1.05);
+            // Coverage drives 35%–85% of max; depth nudges up. Full marks need a near-perfect essay.
+            score = maxScore * (0.35 + 0.5 * covRatio);
+            if (depthIndicators >= 4) score = Math.min(maxScore, score * 1.06);
+            else if (depthIndicators >= 2) score = Math.min(maxScore, score * 1.03);
             // Too short → clearly incomplete content.
             if (wordCount < 60) score = Math.min(score, maxScore * 0.5);
             score = Math.max(maxScore * 0.5, score); // hard floor 50%
@@ -1422,7 +1426,7 @@ function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPo
 
         // Language scoring — stricter base, density-based penalty
         else if (criterionName.includes('语言') || criterionName.includes('language')) {
-            score = maxScore * 0.75; // middle base (was too generous at 0.9)
+            score = maxScore * 0.7; // middle base (kept intentionally modest)
 
             const sCount = Math.max(sentences.length, 1);
             const eRate = errorCount / sCount;
@@ -1443,7 +1447,7 @@ function scoreSubmissionPracticeMode(submission, task, content, coverage, mainPo
 
         // Structure scoring — stricter, rewards real organization
         else if (criterionName.includes('结构') || criterionName.includes('structure')) {
-            score = maxScore * 0.4; // base (was 0.6)
+            score = maxScore * 0.35; // base
 
             const hasGreeting = /^dear\s+\w+/i.test(content.trim());
             const hasClosing = /\b(yours|best regards|sincerely|truly)\b/i.test(content);
